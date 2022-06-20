@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"syscall"
@@ -18,6 +20,7 @@ import (
 	"github.com/snyk/driftctl/pkg/memstore"
 	"github.com/snyk/driftctl/pkg/remote/common"
 	"github.com/snyk/driftctl/pkg/telemetry"
+	tfBackend "github.com/snyk/driftctl/pkg/terraform/backend"
 	"github.com/snyk/driftctl/pkg/terraform/lock"
 	"github.com/spf13/cobra"
 
@@ -43,7 +46,27 @@ func NewScanCmd(opts *pkg.ScanOptions) *cobra.Command {
 		Long:  "Scan",
 		Args:  cobra.NoArgs,
 		PreRunE: func(cmd *cobra.Command, args []string) error {
+			// For now, we only use the global printer to print progress and information about the current scan, so unless one
+			// of the configured output should silence global output we simply use console by default.
+			if output.ShouldPrint(opts.Output, opts.Quiet) {
+				globaloutput.ChangePrinter(globaloutput.NewConsolePrinter())
+			}
+
 			from, _ := cmd.Flags().GetStringSlice("from")
+
+			if len(from) == 0 {
+				// try to retrieve from HCL
+				list, err := retrieveBackendsFromHCL()
+				if err != nil {
+					return err
+				}
+
+				if len(list) > 0 {
+					from = append(from, list...)
+				} else {
+					from = append(from, "tfstate://terraform.tfstate")
+				}
+			}
 
 			iacSource, err := parseFromFlag(from)
 			if err != nil {
@@ -146,7 +169,7 @@ func NewScanCmd(opts *pkg.ScanOptions) *cobra.Command {
 	fl.StringSliceP(
 		"from",
 		"f",
-		[]string{"tfstate://terraform.tfstate"},
+		[]string{},
 		"IaC sources, by default try to find local terraform.tfstate file\n"+
 			"Accepted schemes are: "+strings.Join(supplier.GetSupportedSchemes(), ",")+"\n",
 	)
@@ -253,12 +276,6 @@ func scanRun(opts *pkg.ScanOptions) error {
 
 	alerter := alerter.NewAlerter()
 
-	// For now, we only use the global printer to print progress and information about the current scan, so unless one
-	// of the configured output should silence global output we simply use console by default.
-	if output.ShouldPrint(opts.Output, opts.Quiet) {
-		globaloutput.ChangePrinter(globaloutput.NewConsolePrinter())
-	}
-
 	providerLibrary := terraform.NewProviderLibrary()
 	remoteLibrary := common.NewRemoteLibrary()
 
@@ -359,4 +376,44 @@ func validateTfProviderVersionString(version string) error {
 		return errors.Errorf("Invalid version argument %s, expected a valid semver string (e.g. 2.13.4)", version)
 	}
 	return nil
+}
+
+func retrieveBackendsFromHCL() ([]string, error) {
+	var states []string
+	matches, err := filepath.Glob("*.tf")
+	if err != nil {
+		return states, err
+	}
+
+	for _, match := range matches {
+		b, err := tfBackend.ReadBackendFromFile(match)
+		if err != nil {
+			logrus.
+				WithField("file", match).
+				WithField("error", err).
+				Debug("Error parsing backend block in Terraform file")
+			continue
+		}
+		var statePath string
+
+		switch b.Name {
+		case "local":
+			if b.Path == "" {
+				continue
+			}
+			statePath = fmt.Sprintf("tfstate://%s", path.Join(b.WorkspaceDir, b.Path))
+		case "s3":
+			if b.Bucket == "" || b.Key == "" {
+				continue
+			}
+			statePath = fmt.Sprintf("tfstate+s3://%s/%s", b.Bucket, b.Key)
+		default:
+			continue
+		}
+
+		globaloutput.Printf(color.WhiteString("Using Terraform state %s found in %s. Use the --from flag to specify another state file.\n"), statePath, match)
+		states = append(states, statePath)
+	}
+
+	return states, nil
 }
